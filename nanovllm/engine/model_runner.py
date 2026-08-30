@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -18,18 +19,35 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.dtype = getattr(hf_config, "dtype", None)
+        if self.dtype is None:
+            self.dtype = getattr(hf_config, "torch_dtype", None)
+        if isinstance(self.dtype, str):
+            self.dtype = getattr(torch, self.dtype.removeprefix("torch."))
+        if not isinstance(self.dtype, torch.dtype):
+            raise ValueError(f"model config does not define a torch dtype: {self.dtype!r}")
+
+        model_type = hf_config.model_type
+        if model_type == "qwen3":
+            model_cls = Qwen3ForCausalLM
+            self.is_mla = False
+        elif model_type == "deepseek_v2":
+            model_cls = DeepseekV2ForCausalLM
+            self.is_mla = True
+        else:
+            raise ValueError(f"unsupported model_type: {model_type}")
+        self.enforce_eager = config.enforce_eager or self.is_mla
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        torch.set_default_dtype(self.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        self.model = model_cls(hf_config)
+        load_model(self.model, config.model, strict=self.is_mla)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -107,11 +125,35 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        if self.is_mla:
+            cache_dim = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+            block_bytes = (
+                hf_config.num_hidden_layers
+                * self.block_size
+                * cache_dim
+                * self.dtype.itemsize
+            )
+        else:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+            block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        if self.is_mla:
+            self.kv_cache = torch.empty(
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                cache_dim,
+            )
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "mla_cache"):
+                    module.mla_cache = self.kv_cache[layer_id]
+                    layer_id += 1
+            assert layer_id == hf_config.num_hidden_layers
+            return
+
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

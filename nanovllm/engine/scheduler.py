@@ -12,7 +12,11 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            enable_prefix_cache=config.hf_config.model_type != "deepseek_v2",
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
