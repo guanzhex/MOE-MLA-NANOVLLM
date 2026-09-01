@@ -1,9 +1,11 @@
 import importlib
+import json
 import os
 from glob import glob
 
 import pytest
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -29,6 +31,19 @@ def _load_attention_layer(path: str, layer_idx: int = 0) -> dict[str, torch.Tens
     if not state:
         raise AssertionError(f"no attention weights found for {prefix}")
     return state
+
+
+def _error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    actual_fp32 = actual.float()
+    expected_fp32 = expected.float()
+    absolute_error = (actual_fp32 - expected_fp32).abs()
+    return {
+        "max_abs_error": absolute_error.max().item(),
+        "mean_abs_error": absolute_error.mean().item(),
+        "cosine_similarity": F.cosine_similarity(
+            actual_fp32.flatten(), expected_fp32.flatten(), dim=0
+        ).item(),
+    }
 
 
 def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
@@ -93,6 +108,13 @@ def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
         projected = actual.project(flat_hidden_states)
         q_nope, q_pe, compressed, raw_k_pe, k_nope, value = projected
 
+        reference_metrics = {
+            "q_nope": _error_metrics(q_nope, ref_q_nope),
+            "q_pe_before_yarn": _error_metrics(q_pe, ref_q_pe),
+            "compressed_kv_norm": _error_metrics(compressed, ref_compressed),
+            "raw_k_pe": _error_metrics(raw_k_pe, ref_raw_k_pe),
+        }
+
         torch.testing.assert_close(q_nope, ref_q_nope)
         torch.testing.assert_close(q_pe, ref_q_pe)
         torch.testing.assert_close(compressed, ref_compressed)
@@ -117,6 +139,8 @@ def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
             rtol=projection_rtol,
             atol=projection_atol,
         )
+        reference_metrics["k_nope"] = _error_metrics(k_nope, ref_k_nope)
+        reference_metrics["value"] = _error_metrics(value, ref_value)
 
         positions = torch.arange(num_tokens, device="cuda").unsqueeze(0)
         ref_value_bhsd = ref_value.transpose(0, 1).unsqueeze(0)
@@ -133,3 +157,10 @@ def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
         torch.testing.assert_close(
             k_pe, ref_k_pe_bhsd.squeeze(0).transpose(0, 1), rtol=2e-3, atol=2e-3
         )
+        reference_metrics["q_pe_after_yarn"] = _error_metrics(
+            q_pe, ref_q_pe_bhsd.squeeze(0).transpose(0, 1)
+        )
+        reference_metrics["k_pe_after_yarn"] = _error_metrics(
+            k_pe, ref_k_pe_bhsd.squeeze(0).transpose(0, 1)
+        )
+        print("deepseek_reference_metrics=" + json.dumps(reference_metrics, sort_keys=True))
