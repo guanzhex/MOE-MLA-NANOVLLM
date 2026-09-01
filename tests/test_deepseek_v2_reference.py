@@ -40,8 +40,13 @@ def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
         "modeling_deepseek.DeepseekV2Attention", MODEL_PATH
     )
     reference_module = importlib.import_module(reference_cls.__module__)
-    reference = reference_cls(config, layer_idx=0).cuda().eval()
-    actual = DeepseekV2Attention(config).cuda().eval()
+    model_dtype = getattr(config, "dtype", None) or config.torch_dtype
+    reference = reference_cls(config, layer_idx=0).to(
+        device="cuda", dtype=model_dtype
+    ).eval()
+    actual = DeepseekV2Attention(config).to(
+        device="cuda", dtype=model_dtype
+    ).eval()
 
     state = _load_attention_layer(MODEL_PATH)
     reference.load_state_dict(state, strict=True)
@@ -49,7 +54,6 @@ def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
 
     torch.manual_seed(0)
     num_tokens = 7
-    model_dtype = getattr(config, "dtype", None) or config.torch_dtype
     hidden_states = torch.randn(
         1,
         num_tokens,
@@ -59,51 +63,55 @@ def test_layer_zero_mla_projection_and_yarn_match_official(monkeypatch):
     )
 
     with torch.inference_mode():
-        q = reference.q_proj(hidden_states).view(
-            1, num_tokens, config.num_attention_heads, reference.q_head_dim
-        ).transpose(1, 2)
+        # Use the same token-major 2D GEMM layout on both sides.  F.linear is
+        # mathematically batch-dimension agnostic, but CUDA may choose different
+        # BF16 kernels for [1, N, D] and [N, D], producing harmless rounding
+        # differences that are larger than assert_close's default absolute
+        # tolerance near zero.
+        flat_hidden_states = hidden_states.view(num_tokens, -1)
+        q = reference.q_proj(flat_hidden_states).view(
+            num_tokens, config.num_attention_heads, reference.q_head_dim
+        )
         ref_q_nope, ref_q_pe = q.split(
             [config.qk_nope_head_dim, config.qk_rope_head_dim], dim=-1
         )
-        kv_a = reference.kv_a_proj_with_mqa(hidden_states)
+        kv_a = reference.kv_a_proj_with_mqa(flat_hidden_states)
         ref_compressed, ref_raw_k_pe = kv_a.split(
             [config.kv_lora_rank, config.qk_rope_head_dim], dim=-1
         )
         ref_compressed = reference.kv_a_layernorm(ref_compressed)
         ref_kv = reference.kv_b_proj(ref_compressed).view(
-            1,
             num_tokens,
             config.num_attention_heads,
             config.qk_nope_head_dim + config.v_head_dim,
-        ).transpose(1, 2)
+        )
         ref_k_nope, ref_value = ref_kv.split(
             [config.qk_nope_head_dim, config.v_head_dim], dim=-1
         )
-        ref_raw_k_pe = ref_raw_k_pe.view(
-            1, num_tokens, 1, config.qk_rope_head_dim
-        ).transpose(1, 2)
+        ref_raw_k_pe = ref_raw_k_pe.view(num_tokens, 1, config.qk_rope_head_dim)
 
-        projected = actual.project(hidden_states.view(num_tokens, -1))
+        projected = actual.project(flat_hidden_states)
         q_nope, q_pe, compressed, raw_k_pe, k_nope, value = projected
 
-        torch.testing.assert_close(q_nope, ref_q_nope.squeeze(0).transpose(0, 1))
-        torch.testing.assert_close(q_pe, ref_q_pe.squeeze(0).transpose(0, 1))
-        torch.testing.assert_close(compressed, ref_compressed.squeeze(0))
-        torch.testing.assert_close(
-            raw_k_pe, ref_raw_k_pe.squeeze(0).transpose(0, 1)
-        )
-        torch.testing.assert_close(k_nope, ref_k_nope.squeeze(0).transpose(0, 1))
-        torch.testing.assert_close(value, ref_value.squeeze(0).transpose(0, 1))
+        torch.testing.assert_close(q_nope, ref_q_nope)
+        torch.testing.assert_close(q_pe, ref_q_pe)
+        torch.testing.assert_close(compressed, ref_compressed)
+        torch.testing.assert_close(raw_k_pe, ref_raw_k_pe)
+        torch.testing.assert_close(k_nope, ref_k_nope)
+        torch.testing.assert_close(value, ref_value)
 
         positions = torch.arange(num_tokens, device="cuda").unsqueeze(0)
-        cos, sin = reference.rotary_emb(ref_value, seq_len=num_tokens)
-        ref_q_pe, ref_k_pe = reference_module.apply_rotary_pos_emb(
-            ref_q_pe, ref_raw_k_pe, cos, sin, positions
+        ref_value_bhsd = ref_value.transpose(0, 1).unsqueeze(0)
+        ref_q_pe_bhsd = ref_q_pe.transpose(0, 1).unsqueeze(0)
+        ref_raw_k_pe_bhsd = ref_raw_k_pe.transpose(0, 1).unsqueeze(0)
+        cos, sin = reference.rotary_emb(ref_value_bhsd, seq_len=num_tokens)
+        ref_q_pe_bhsd, ref_k_pe_bhsd = reference_module.apply_rotary_pos_emb(
+            ref_q_pe_bhsd, ref_raw_k_pe_bhsd, cos, sin, positions
         )
         q_pe, k_pe = actual.rotary_emb(positions.squeeze(0), q_pe, raw_k_pe)
         torch.testing.assert_close(
-            q_pe, ref_q_pe.squeeze(0).transpose(0, 1), rtol=2e-3, atol=2e-3
+            q_pe, ref_q_pe_bhsd.squeeze(0).transpose(0, 1), rtol=2e-3, atol=2e-3
         )
         torch.testing.assert_close(
-            k_pe, ref_k_pe.squeeze(0).transpose(0, 1), rtol=2e-3, atol=2e-3
+            k_pe, ref_k_pe_bhsd.squeeze(0).transpose(0, 1), rtol=2e-3, atol=2e-3
         )
