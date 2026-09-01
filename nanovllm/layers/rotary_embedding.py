@@ -15,6 +15,18 @@ def apply_rotary_emb(
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 
+def apply_deepseek_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Match the checkpoint reference's dtype-preserving YaRN arithmetic."""
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    y1 = x1 * cos - x2 * sin
+    y2 = x2 * cos + x1 * sin
+    return torch.cat((y1, y2), dim=-1)
+
+
 class RotaryEmbedding(nn.Module):
 
     def __init__(
@@ -151,8 +163,9 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
 
     @staticmethod
     def _to_rotate_half_layout(x: torch.Tensor) -> torch.Tensor:
-        # DeepSeek projections store adjacent real/imag pairs.  The shared
-        # apply_rotary_emb helper expects the first-half/second-half layout.
+        # DeepSeek's q_pe/k_pe projection stores adjacent rotary pairs, while
+        # the reference rotate_half operation consumes first-half/second-half
+        # layout. Convert once before applying the shared half-rotation helper.
         shape = x.shape
         return x.view(*shape[:-1], shape[-1] // 2, 2).transpose(-1, -2).reshape(shape)
 
@@ -164,8 +177,18 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(self._to_rotate_half_layout(query), cos, sin)
-        key = apply_rotary_emb(self._to_rotate_half_layout(key), cos, sin)
+        # The official DeepSeek cache casts cos/sin to the activation dtype on
+        # first use, then performs the rotation without promoting BF16 inputs
+        # to FP32. Keep that numerical order for checkpoint-level parity while
+        # leaving the original Qwen rotary helper unchanged.
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
+        query = apply_deepseek_rotary_emb(
+            self._to_rotate_half_layout(query), cos, sin
+        )
+        key = apply_deepseek_rotary_emb(
+            self._to_rotate_half_layout(key), cos, sin
+        )
         return query, key
 
 
